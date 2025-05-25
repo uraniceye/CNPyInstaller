@@ -85,10 +85,239 @@ import time
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox 
+from tkinter import filedialog, messagebox
 import webbrowser
 import re
-import logging # <--- 将 import logging 移到这里（全局导入区域）
+import logging
+import ast  # <--- 确保导入 ast 模块
+import sys  # <--- 确保导入 sys 模块 (如果尚未导入)
+
+# --------------------------------------------------------------------------
+#  DependencyScanner 类的完整定义 
+# --------------------------------------------------------------------------
+class DependencyScanner:
+    """
+    一个用于扫描Python项目文件以查找潜在外部依赖项（可能被PyInstaller遗漏）的类。
+    它使用 ast 模块解析Python代码，提取导入语句，并进行过滤。
+    """
+    def __init__(self, project_root_path: Path, existing_hidden_imports: list[str], logger_func=None):
+        """
+        初始化扫描器。
+
+        Args:
+            project_root_path (Path): 项目的根目录路径。
+            existing_hidden_imports (list[str]): 用户已在UI中配置的隐藏导入列表。
+            logger_func (callable, optional): 用于记录日志的回调函数。
+                                              如果为None，则默认使用 print。
+                                              期望的函数签名: logger_func(message: str, level: str = "INFO")
+        """
+        self.project_root = project_root_path.resolve() # 项目根目录的绝对路径
+        self.existing_hidden_imports = set(existing_hidden_imports) # 已配置的隐藏导入 (集合去重)
+        self.found_potential_dependencies = set() # 存储扫描到的潜在依赖 (集合去重)
+        self.logger = logger_func if logger_func else print # 日志记录函数
+
+        # 获取Python标准库模块列表
+        try:
+            self.std_lib_modules = sys.stdlib_module_names # Python 3.10+
+            if self.logger and callable(self.logger):
+                 self.logger(f"[依赖扫描器] 使用 sys.stdlib_module_names 获取标准库列表。", "DEBUG")
+        except AttributeError:
+            # Python < 3.10 的回退标准库列表
+            self.std_lib_modules = {
+                'os', 'sys', 'math', 'json', 're', 'collections', 'datetime', 'abc',
+                'itertools', 'functools', 'logging', 'threading', 'subprocess', 'atexit',
+                'multiprocessing', 'argparse', 'time', 'io', 'pathlib', 'socket', 'array',
+                'select', 'struct', 'pickle', 'copy', 'textwrap', 'getopt', 'signal', 'queue',
+                'urllib', 'http', 'random', 'hashlib', 'base64', 'csv', 'sqlite3', 'gettext',
+                'xml', 'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma', 'enum', 'typing', 'mmap',
+                'weakref', 'gc', '_thread', 'operator', 'asyncio', 'concurrent', 'contextlib', 'secrets',
+                'dataclasses', 'inspect', 'shutil', 'tempfile', 'warnings', 'webbrowser', 'traceback',
+                '_socket', '_ssl', '_elementtree', 'decimal', 'ctypes', 'email', 'curses', 'wsgiref',
+                'tkinter',
+            }
+            if self.logger and callable(self.logger):
+                self.logger(f"[依赖扫描器] 当前Python版本 ({sys.version_info.major}.{sys.version_info.minor}) 无 sys.stdlib_module_names, "
+                            f"使用内置回退列表 ({len(self.std_lib_modules)} 个模块)。", "DEBUG")
+
+
+    def _is_project_module(self, module_name: str) -> bool:
+        """
+        检查一个模块名是否可能指向项目内部的模块（即源文件在项目根目录下）。
+        这是一个启发式检查。
+
+        Args:
+            module_name (str): 要检查的模块名 (通常是导入语句的第一部分，如 "my_package")。
+
+        Returns:
+            bool: 如果模块可能是项目内部模块，则返回True，否则返回False。
+        """
+        if not module_name: # 防御空模块名
+            return False
+
+        # 检查项目根目录下是否存在名为 module_name 的目录 (可能是一个包)
+        potential_package_path = self.project_root / module_name
+        if potential_package_path.is_dir():
+            # 如果是目录，进一步检查是否存在 __init__.py 文件，以更确认为包
+            if (potential_package_path / "__init__.py").is_file():
+                return True
+            # (可以根据需要添加对命名空间包的更宽松判断，但当前以明确结构为主)
+
+        # 检查项目根目录下是否存在名为 module_name.py 的文件 (可能是一个模块文件)
+        potential_module_file_path = self.project_root / f"{module_name}.py"
+        if potential_module_file_path.is_file():
+            return True
+
+        return False # 如果以上都不是，则认为不是项目内部模块
+
+    def _extract_imports_from_file(self, file_path: Path):
+        """
+        解析单个Python文件，使用 ast 模块提取其中的导入语句，并识别潜在的外部依赖。
+        会将找到的依赖添加到 self.found_potential_dependencies 集合中。
+
+        Args:
+            file_path (Path): 要解析的Python文件的路径。
+        """
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f: # 以UTF-8编码读取
+                content = f.read()
+            tree = ast.parse(content, filename=str(file_path)) # 解析为抽象语法树
+
+            # 遍历AST中的所有节点
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import): # 处理 'import foo' 或 'import foo, bar.baz'
+                    for alias_node in node.names: # 遍历所有被导入的项 (ast.alias 对象)
+                        # alias_node.name 是导入的完整名称，如 'requests' 或 'my_package.sub_module'
+                        # 我们取其第一部分作为顶层模块名，如 'requests' 或 'my_package'
+                        top_level_module = alias_node.name.split('.')[0]
+
+                        # 进行过滤：非空、非标准库、非项目内部模块
+                        if top_level_module and \
+                           top_level_module not in self.std_lib_modules and \
+                           not self._is_project_module(top_level_module):
+                            self.found_potential_dependencies.add(top_level_module) # 添加到结果集
+
+                elif isinstance(node, ast.ImportFrom): # 处理 'from foo import bar' 或 'from foo.bar import baz'
+                    # node.module 是 'from' 后面的模块路径，如 'foo' 或 'foo.bar'
+                    # node.level > 0 表示是相对导入 (如 'from . import X')，我们只关心绝对导入 (level == 0)
+                    if node.module and node.level == 0:
+                        top_level_module = node.module.split('.')[0] # 取顶层模块名
+
+                        # 同样进行过滤
+                        if top_level_module and \
+                           top_level_module not in self.std_lib_modules and \
+                           not self._is_project_module(top_level_module):
+                            self.found_potential_dependencies.add(top_level_module)
+
+        except SyntaxError as e: # 捕获Python语法错误
+            if self.logger and callable(self.logger):
+                err_line = f"(在第 {e.lineno} 行附近)" if hasattr(e, 'lineno') and e.lineno else ""
+                self.logger(f"[依赖扫描器] 解析文件 {file_path.name} 时发生语法错误: {e} {err_line}", "WARNING")
+        except Exception as e: # 捕获其他可能的错误
+            if self.logger and callable(self.logger):
+                self.logger(f"[依赖扫描器] 处理文件 {file_path.name} 时发生未知错误: {e}", "ERROR")
+                import traceback # 导入traceback以获取详细堆栈
+                self.logger(traceback.format_exc(), "DEBUG") # 记录完整错误堆栈到DEBUG级别
+
+
+    def scan(self) -> list[str]:
+        """
+        执行扫描操作。
+        递归查找项目根目录下的所有 `.py` 文件，对每个文件提取导入项，
+        最后返回一个去重、排序、且不包含已存在隐藏导入的潜在依赖项列表。
+
+        Returns:
+            list[str]: 排序后的潜在新依赖项模块名列表。
+        """
+        if self.logger and callable(self.logger):
+            self.logger(f"[依赖扫描器] 开始扫描项目根目录: {self.project_root}", "INFO")
+
+        processed_file_count = 0 # 记录已处理的文件数
+        skipped_file_count = 0   # 记录已跳过的文件数
+
+        # 递归查找项目根目录下的所有 .py 文件
+        for py_file in self.project_root.rglob("*.py"):
+            # 应用启发式规则来跳过常见的非项目代码目录和文件
+            # (例如虚拟环境、缓存、测试文件、版本控制目录等)
+            path_str_lower = str(py_file).lower() # 路径转小写以便不区分大小写比较
+            try:
+                relative_path_to_root = py_file.relative_to(self.project_root) # 获取相对于项目根的路径
+                relative_path_parts = relative_path_to_root.parts
+            except ValueError: # 如果py_file不在project_root下（理论上rglob不会，但防御一下）
+                relative_path_parts = py_file.parts
+
+
+            # 定义需要忽略的目录名或路径片段 (通常是小写)
+            ignore_dir_keywords = [
+                "site-packages", "dist-packages",       # Python包安装目录
+                "lib/python",                           # 标准库或虚拟环境的lib目录 (需要更精确判断)
+                ".git", ".hg", ".svn",                  # 版本控制系统目录
+                "__pycache__",                          # Python字节码缓存
+                ".pytest_cache", ".mypy_cache",         # 测试和类型检查工具的缓存
+                "node_modules",                         # Node.js 模块目录
+                "venv", "env", ".venv", ".env",         # 常见的虚拟环境目录名
+                "migrations",                           # Django/Alembic等数据库迁移目录
+                "tests", "test",                        # 测试代码目录
+                "docs", "doc",                          # 文档目录
+                "examples", "samples",                  # 示例代码目录
+                "build", "dist",                        # PyInstaller或setuptools的输出目录
+            ]
+            # 定义需要忽略的文件名 (通常是小写)
+            ignore_filenames = [
+                "setup.py",                             # 项目打包脚本
+                "manage.py",                            # Django管理脚本
+                "conftest.py",                          # Pytest配置文件
+            ]
+            # 定义需要忽略的文件名后缀 (通常是小写)
+            ignore_filename_suffixes = [
+                "_test.py", "_tests.py",                # 测试文件名后缀
+                ".spec",                                # PyInstaller的spec文件
+            ]
+
+            should_skip = False
+            # 1. 检查路径中是否包含忽略的目录关键字 (检查相对路径的每个部分)
+            for part in relative_path_parts:
+                if part.lower() in ignore_dir_keywords:
+                    should_skip = True
+                    break
+                # 检查是否是隐藏目录 (以点开头，但不是 "." 或 "..")
+                if part.startswith(".") and len(part) > 1:
+                    # 确保这个以点开头的路径部分确实对应一个目录
+                    if (self.project_root / Path(*relative_path_parts[:relative_path_parts.index(part)+1])).is_dir():
+                        should_skip = True
+                        break
+            
+            if not should_skip:
+                # 2. 检查文件名是否完全匹配忽略列表
+                if py_file.name.lower() in ignore_filenames:
+                    should_skip = True
+                # 3. 检查文件名是否以忽略的后缀结尾
+                if not should_skip:
+                    for suffix in ignore_filename_suffixes:
+                        if py_file.name.lower().endswith(suffix):
+                            should_skip = True
+                            break
+            
+            # 如果根据规则应该跳过此文件
+            if should_skip:
+                if self.logger and callable(self.logger):
+                    self.logger(f"[依赖扫描器] 跳过文件 (基于启发式规则): {relative_path_to_root if 'relative_path_to_root' in locals() else py_file.name}", "DEBUG")
+                skipped_file_count += 1
+                continue # 继续处理下一个文件
+
+            # 如果文件未被跳过，则处理它
+            if self.logger and callable(self.logger):
+                self.logger(f"[依赖扫描器] 正在处理文件: {relative_path_to_root if 'relative_path_to_root' in locals() else py_file.name}", "DEBUG")
+            self._extract_imports_from_file(py_file) # 解析文件并提取导入
+            processed_file_count += 1
+
+        if self.logger and callable(self.logger):
+            self.logger(f"[依赖扫描器] 扫描完成。共处理 {processed_file_count} 个 .py 文件，跳过 {skipped_file_count} 个文件。", "INFO")
+
+        # 从找到的潜在依赖项中，移除那些用户已在UI中声明为隐藏导入的模块
+        final_potential_dependencies = self.found_potential_dependencies - self.existing_hidden_imports
+
+        return sorted(list(final_potential_dependencies)) # 返回排序后的列表
+
 
 # --- 全局外观设置 ---
 # ... (ctk.set_appearance_mode 和 ctk.set_default_color_theme)
@@ -524,6 +753,7 @@ class UltraModernPyInstallerGUI:
         tools_grid_container.grid_columnconfigure((0,1,2), weight=1, uniform="tool_button_col")
 
         tools_definitions = [
+            # ... (已有的工具定义)
             ("🧹 清理构建文件", self.clean_build_files, "清理所有PyInstaller构建产生的临时文件和输出目录。"),
             ("📁 打开输出目录", self.open_output_dir, "在文件浏览器中快速打开打包结果所在的输出目录。"),
             ("📋 复制构建命令", self.copy_command, "将当前配置生成的完整PyInstaller命令行复制到系统剪贴板。"),
@@ -531,6 +761,9 @@ class UltraModernPyInstallerGUI:
             ("📂 加载配置文件", self.load_config_file, "从之前保存的JSON文件中加载配置参数到当前界面。"),
             ("🔧 检查依赖环境", self.check_dependencies, "检查PyInstaller、UPX以及项目中可能需要的常用第三方库是否可用。"),
             ("📝 打开 .spec 文件", self.open_spec_file, "在系统默认文本编辑器中打开当前项目生成的.spec配置文件 (高级用户)。"),
+            # --- 新增工具 ---
+            ("🐍 扫描项目依赖", self.scan_project_for_dependencies, "扫描项目内的Python文件，查找潜在的、PyInstaller可能遗漏的第三方依赖项。"),
+            # ---
             ("📖 查看官方文档", self.open_docs, "在浏览器中打开PyInstaller官方在线文档 (英文)。"),
             ("ℹ️ 关于本软件", self.show_about, "显示本软件的版本信息、特性和开发者信息。"),
             ("🎨 切换界面主题", self.toggle_theme, "在明亮和深色两种界面主题之间进行一键切换。")
@@ -1312,7 +1545,116 @@ class UltraModernPyInstallerGUI:
         finally:
             # 无论构建成功与否，最终都需要重置UI的构建按钮状态
             self._reset_build_button_ui_state()
+
+    def generate_command(self) -> list[str]:
+        """
+        根据当前UI上的配置，生成 PyInstaller 的命令行参数列表。
+        当指定输出目录时，会自动将 workpath (build目录) 和 specpath (spec文件目录)
+        设置在输出目录附近，以保持文件结构整洁。
+
+        Returns:
+            list[str]: PyInstaller 命令及其参数组成的列表。如果关键配置（如主脚本）缺失，可能返回空列表。
+        """
+        # 1. 获取主脚本路径 (这是必需的)
+        script_path_str = self.script_path.get()
+        if not script_path_str:
+            if hasattr(self, 'show_error') and callable(self.show_error):
+                self.show_error("命令生成错误", "未选择Python主脚本，无法生成PyInstaller命令！")
+            self._log_to_terminal("❌ 命令生成失败：未指定主脚本。", "ERROR")
+            return []
+
+        command = ['pyinstaller'] # 初始化命令列表
+
+        # --- 基本打包选项 ---
+        if self.is_onefile.get(): command.append('--onefile')
+        if self.is_windowed.get(): command.append('--noconsole')
+        if self.is_debug.get(): command.append('--debug=all')
+        if self.is_clean.get(): command.append('--clean')
+
+        # --- 应用名称和图标 ---
+        app_name_str = self.app_name.get()
+        if app_name_str: command.extend(['--name', app_name_str])
         
+        icon_path_str = self.icon_path.get()
+        if icon_path_str: command.extend(['--icon', icon_path_str])
+
+        # --- 路径相关选项 ---
+        output_dir_user_specified_str = self.output_dir.get() # 用户在UI上指定的“构建输出目录”
+        
+        # 确定 .spec 文件名 (基于应用名或脚本名)
+        # PyInstaller 默认 spec 文件名与 --name 参数一致，若无 --name 则与脚本主文件名一致
+        spec_file_basename = (app_name_str or Path(script_path_str).stem) + ".spec"
+
+        if output_dir_user_specified_str:
+            # 用户指定了输出目录
+            dist_path = Path(output_dir_user_specified_str).resolve() # 最终可执行文件/包的输出目录
+            command.extend(['--distpath', str(dist_path)])
+
+            # 将 .spec 文件和 build 目录 (workpath) 放在 distpath 的父目录下，
+            # 或者与 distpath 在同一层级，但有不同命名，以保持结构清晰。
+            # 例如：
+            # D:/OutputFolder/
+            # ├── MyApp.spec  <-- specpath 指向这里
+            # ├── build_MyApp/ <-- workpath 指向这里
+            # └── dist_MyApp/  <-- distpath 指向这里 (用户指定的 output_dir)
+
+            # 确定 specpath (存放 .spec 文件的目录)
+            # 我们将其设置为用户指定输出目录的父目录
+            spec_dir = dist_path.parent
+            command.extend(['--specpath', str(spec_dir)])
+
+            # 确定 workpath (存放 build 临时文件的目录)
+            # 我们将其设置为用户指定输出目录父目录下的一个 'build_[app_name]' 文件夹
+            build_dir_name = f"build_{app_name_str or Path(script_path_str).stem}"
+            work_path = spec_dir / build_dir_name # 与 .spec 文件同级
+            command.extend(['--workpath', str(work_path)])
+        else:
+            # 用户未指定输出目录，PyInstaller 将使用默认路径：
+            # distpath: ./dist (相对于 spec 文件或当前工作目录)
+            # workpath: ./build
+            # specpath: . (当前目录，通常是脚本所在目录)
+            # 在这种情况下，我们不需要显式添加这些路径参数，让PyInstaller使用默认值即可。
+            pass
+
+        # --- 模块管理 ---
+        exclude_modules_str = self.exclude_modules.get()
+        if exclude_modules_str:
+            for ex_mod in exclude_modules_str.split(','):
+                ex_mod = ex_mod.strip()
+                if ex_mod: command.extend(['--exclude-module', ex_mod])
+
+        hidden_imports_str = self.hidden_imports.get()
+        if hidden_imports_str:
+            for hid_imp in hidden_imports_str.split(','):
+                hid_imp = hid_imp.strip()
+                if hid_imp: command.extend(['--hidden-import', hid_imp])
+
+        # --- 附加数据文件 ---
+        for data_entry_str in self.add_data_list:
+            if data_entry_str: command.extend(['--add-data', data_entry_str])
+
+        # --- UPX 压缩 ---
+        if self.is_upx.get():
+            upx_dir_str = self.upx_dir.get()
+            if upx_dir_str: command.extend(['--upx-dir', upx_dir_str])
+            else: command.append('--upx')
+
+        # --- (可选) 项目根目录作为附加搜索路径 ---
+        project_root_path_str = self.project_root_dir.get()
+        if project_root_path_str:
+            # command.extend(['--paths', project_root_path_str]) # 如果需要，可以取消注释
+            pass
+
+        # --- 最后添加主脚本 ---
+        command.append(script_path_str)
+
+        if hasattr(self, '_log_to_terminal') and callable(self._log_to_terminal):
+            self._log_to_terminal(f"⚙️ 生成的PyInstaller命令: {' '.join(command)}", "CMD")
+
+        return command
+
+
+
     # --- UI界面更新与日志记录辅助方法 (规范化，增加winfo_exists检查以增强稳定性) ---
 
     def _log_to_terminal(self, text_message: str, message_level: str = "INFO"):
@@ -1583,7 +1925,9 @@ class UltraModernPyInstallerGUI:
             error_msg = f"生成或复制构建命令时发生错误: {str(e_copy_cmd)}"
             self._log_to_terminal(f"   ❌ 复制命令失败: {error_msg}")
             self.show_error("复制失败", error_msg)
-            
+
+
+
     def check_dependencies(self):
         """(工具箱) 检查PyInstaller、UPX及常用第三方库的状态，并记录到日志。"""
         # 中文注释: 检查环境依赖，给用户参考。
@@ -1662,6 +2006,189 @@ class UltraModernPyInstallerGUI:
                        "依赖环境检查已完成（增强版）。\n\n"
                        "请仔细查看“构建输出”选项卡中的日志了解详细信息，特别是关于PyInstaller、UPX以及其他可能需要的第三方库的提示。")
         if hasattr(self, 'tabview'): self.tabview.set("📱 构建输出") # 自动切换到输出标签页
+
+    def scan_project_for_dependencies(self):
+        """
+        (工具箱功能) 扫描项目文件以查找潜在的隐藏导入项。
+        这是用户点击“扫描项目依赖”按钮时调用的入口方法。
+        """
+        project_root_str = self.project_root_dir.get() # 获取用户在UI上设置的项目根目录
+
+        # 检查项目根目录是否有效
+        if not project_root_str or not Path(project_root_str).is_dir():
+            self.show_warning("项目根目录未设置", "请先在“基础配置”中设置有效的项目根目录，然后才能扫描依赖项。")
+            self._log_to_terminal("⚠️ 尝试扫描依赖项失败：项目根目录未设置或无效。", "WARNING")
+            return # 如果无效，则中止操作
+
+        # 向UI日志输出提示信息，并更新顶部状态栏
+        self._log_to_terminal("🐍 开始扫描项目依赖项...", "INFO")
+        self.update_status("🟡", "依赖扫描中...")
+
+        # (可选) 禁用扫描按钮，防止用户在扫描过程中重复点击
+        # 示例: if hasattr(self, 'tools_scan_button'): self.tools_scan_button.configure(state="disabled")
+        # 注意：你需要确保 self.tools_scan_button 引用了正确的按钮实例
+
+        # 获取当前“隐藏导入”输入框中的内容，并转换为列表
+        current_hidden_imports_list = [s.strip() for s in self.hidden_imports.get().split(',') if s.strip()]
+
+        # 创建并启动一个新的后台线程来执行耗时的扫描操作，避免GUI卡死
+        scan_thread = threading.Thread(
+            target=self._execute_dependency_scan_in_thread, # 指定线程要执行的目标函数
+            args=(Path(project_root_str), current_hidden_imports_list), # 传递参数给目标函数
+            daemon=True # 设置为守护线程，这样主程序退出时此线程也会自动结束
+        )
+        scan_thread.start() # 启动线程
+
+    def _execute_dependency_scan_in_thread(self, project_root_path: Path, current_hidden_imports_list: list[str]):
+        """
+        在后台线程中执行实际的依赖扫描逻辑。
+        此方法不直接操作UI，而是通过 self.root.after() 将UI更新任务调度回主线程。
+        """
+        try:
+            # 创建 DependencyScanner 实例，并将GUI的日志记录方法传递给它
+            # 这样扫描器内部的日志也可以输出到GUI的日志区域
+            scanner = DependencyScanner(
+                project_root_path,
+                current_hidden_imports_list,
+                logger_func=self._log_to_terminal # 将 self._log_to_terminal 作为日志回调
+            )
+            potential_new_dependencies = scanner.scan() # 执行扫描，获取潜在的新依赖项列表
+
+            # 扫描完成后，将结果传递回主线程以显示对话框
+            if self.root.winfo_exists(): # 确保主窗口仍然存在
+                self.root.after(0, self._show_dependency_scan_results_dialog, potential_new_dependencies)
+
+            self._log_to_terminal(f"✅ 依赖项扫描完成。发现 {len(potential_new_dependencies)} 个潜在的新依赖项。", "SUCCESS")
+            self.update_status("🟢", "依赖扫描完成")
+
+        except Exception as e: # 捕获扫描过程中可能发生的任何异常
+            self._log_to_terminal(f"❌ 依赖项扫描过程中发生严重错误: {e}", "ERROR")
+            import traceback # 导入traceback模块以获取详细的错误堆栈信息
+            self._log_to_terminal(traceback.format_exc(), "DEBUG") # 将完整堆栈记录到日志
+            self.update_status("🔴", "依赖扫描失败")
+
+            if self.root.winfo_exists(): # 确保主窗口存在再弹窗
+                # 使用 lambda 确保 e 的值在 after 调用时是正确的
+                self.root.after(0, lambda err_msg=str(e): self.show_error(
+                    "依赖扫描失败",
+                    f"依赖项扫描过程中发生了一个错误:\n{err_msg}\n\n详情请查看日志。"
+                ))
+        finally:
+            # (可选) 无论成功与否，都重新启用扫描按钮
+            # 示例:
+            # if self.root.winfo_exists() and hasattr(self, 'tools_scan_button'):
+            #     self.root.after(0, lambda: self.tools_scan_button.configure(state="normal"))
+            pass # 占位，如果上面有启用按钮的逻辑，这里就不需要了
+
+    def _show_dependency_scan_results_dialog(self, potential_new_deps_list: list[str]):
+        """
+        在主UI线程中创建并显示包含扫描结果的对话框。
+        用户可以在此对话框中选择要添加到“隐藏导入”列表的模块。
+        """
+        # 如果没有找到新的潜在依赖项，则显示提示信息并直接返回
+        if not potential_new_deps_list:
+            self.show_info("扫描结果", "未找到新的潜在外部依赖项。\n\n(已自动排除Python标准库、项目内部模块以及您已在“隐藏导入”列表中声明的模块。)")
+            return
+
+        # 创建一个新的顶层窗口 (CTkToplevel) 作为模态对话框
+        dialog_window = ctk.CTkToplevel(self.root)
+        dialog_window.title("潜在依赖项扫描结果")
+        dialog_window.geometry("550x650") # 设置对话框的初始大小
+        dialog_window.transient(self.root) # 将此对话框设置为self.root的瞬态窗口（通常会显示在父窗口之上）
+        dialog_window.grab_set() # 使对话框成为模态的，阻止用户与主窗口交互，直到此对话框关闭
+
+        # 在对话框顶部添加说明标签
+        ctk.CTkLabel(dialog_window, text="以下是扫描到的潜在外部依赖项：", font=self.font_default_bold).pack(pady=(15, 5), padx=20)
+        ctk.CTkLabel(dialog_window, text="请选择您希望添加到“隐藏导入”列表中的模块。", font=self.font_small).pack(pady=(0, 15), padx=20)
+
+        # 创建一个可滚动的Frame，用于容纳可能很长的复选框列表
+        scrollable_checkbox_frame = ctk.CTkScrollableFrame(dialog_window, width=500, height=400)
+        scrollable_checkbox_frame.pack(pady=10, padx=20, fill="both", expand=True)
+
+        selected_module_vars = {} # 创建一个字典来存储每个模块名及其对应的Tkinter布尔变量 (tk.BooleanVar)
+                                 # tk.BooleanVar 用于跟踪复选框的选中状态
+
+        # 遍历扫描到的潜在依赖项列表，为每一项创建一个复选框
+        for dep_name in potential_new_deps_list:
+            tk_bool_var = tk.BooleanVar(value=False) # 默认情况下，复选框是不选中的
+            selected_module_vars[dep_name] = tk_bool_var # 将模块名和布尔变量存入字典
+
+            # 创建CTkCheckBox控件
+            ctk.CTkCheckBox(
+                scrollable_checkbox_frame,
+                text=dep_name, # 复选框旁边显示的文本（模块名）
+                variable=tk_bool_var, # 将复选框的选中状态与布尔变量绑定
+                font=self.font_default, # 使用预定义的字体
+                checkbox_width=20, checkbox_height=20, # 可以调整复选框本身的大小
+                corner_radius=3 # 复选框的圆角
+            ).pack(anchor="w", padx=15, pady=4) # pack到可滚动Frame中，左对齐，并设置内外边距
+
+        def _add_selected_dependencies_to_hidden_imports_list():
+            """
+            内部辅助函数，当用户点击“添加选中项”按钮时被调用。
+            它会收集所有被选中的模块，并将它们添加到主UI的“隐藏导入”输入框中。
+            """
+            # 从 selected_module_vars 字典中筛选出所有被用户选中的模块
+            imports_to_be_added = [dep_name for dep_name, tk_var in selected_module_vars.items() if tk_var.get()]
+
+            # 如果用户没有选择任何模块，则显示提示信息并返回
+            if not imports_to_be_added:
+                # parent=dialog_window 确保这个消息框显示在当前对话框之上，而不是主窗口之上
+                self.show_info("未选择", "您没有选择任何依赖项进行添加。", parent=dialog_window)
+                return
+
+            # 获取当前“隐藏导入”输入框中的内容，并转换为一个集合（set）以方便去重和添加
+            current_hidden_imports_str = self.hidden_imports.get()
+            current_hidden_imports_set = {s.strip() for s in current_hidden_imports_str.split(',') if s.strip()}
+
+            newly_added_count = 0 # 计数器，记录实际新添加的模块数量
+            # 遍历用户选中的模块列表
+            for imp_to_add in imports_to_be_added:
+                if imp_to_add not in current_hidden_imports_set: # 如果该模块尚未在隐藏导入列表中
+                    current_hidden_imports_set.add(imp_to_add) # 将其添加到集合中
+                    newly_added_count += 1
+
+            # 将更新后的隐藏导入模块集合转换回逗号分隔的字符串，并更新到UI的输入框
+            # 使用 sorted() 使输出的列表有序，更美观
+            self.hidden_imports.set(", ".join(sorted(list(current_hidden_imports_set))))
+
+            # 记录日志并显示成功消息
+            self._log_to_terminal(f"➕ 已将 {newly_added_count} 个选中的依赖项添加到“隐藏导入”列表。", "SUCCESS")
+            self.show_success("添加成功", f"已成功将 {newly_added_count} 个依赖项添加到“隐藏导入”列表。", parent=dialog_window)
+
+            dialog_window.destroy() # 完成操作后关闭当前对话框
+
+        # 创建底部按钮区域的Frame (用于放置“添加”和“取消”按钮)
+        bottom_button_frame = ctk.CTkFrame(dialog_window, fg_color="transparent") # 透明背景
+        bottom_button_frame.pack(pady=(10, 15), fill="x", padx=20) # pack并设置边距
+        # 配置Grid布局，使两个按钮能平均分配宽度
+        bottom_button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        # 创建“添加选中项到隐藏导入”按钮
+        add_selected_button = ctk.CTkButton(
+            bottom_button_frame,
+            text="添加选中项到隐藏导入",
+            command=_add_selected_dependencies_to_hidden_imports_list, # 点击时调用上面的辅助函数
+            font=self.font_button,
+            height=35 # 设置按钮高度
+        )
+        add_selected_button.grid(row=0, column=0, padx=(0, 5), sticky="ew") # 使用Grid布局，sticky="ew"使其水平填充
+
+        # 创建“取消”按钮
+        cancel_scan_button = ctk.CTkButton(
+            bottom_button_frame,
+            text="取消",
+            command=dialog_window.destroy, # 点击时直接关闭对话框
+            font=self.font_button,
+            fg_color=("gray65", "gray40"), # 为取消按钮设置不同的颜色
+            hover_color=("gray75", "gray50"), # 鼠标悬停颜色
+            height=35
+        )
+        cancel_scan_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        # 确保对话框显示在所有其他窗口之上并获得焦点
+        dialog_window.after(100, dialog_window.lift) # 提升窗口层级
+        dialog_window.after(150, dialog_window.focus_set) # 设置焦点
 
     def open_spec_file(self):
         """(工具箱) 在系统默认文本编辑器中打开当前项目生成的.spec文件。"""
@@ -2051,27 +2578,58 @@ def _main_install_pyinstaller_if_needed():
     """
     (主程序启动时调用) 检查系统中是否已安装PyInstaller。
     如果未安装，则提示用户是否立即使用pip尝试安装。
+    在 pythonw.exe 环境下会避免使用 input()。
+
     返回:
-        bool: True 如果PyInstaller已安装或成功安装提示已给出，False 如果用户拒绝安装或安装失败。
+        bool: True 如果PyInstaller已安装或成功安装提示已给出（或在pythonw下跳过提示），
+              False 如果用户明确拒绝安装或安装失败或在pythonw下无法交互。
     """
-    # 这里需要 logging 模块，确保它在使用前已被导入 (在 main 函数中导入)
-    logger = logging.getLogger(__name__) # 获取此函数的logger (如果希望与main的logger区分)
-                                        # 或者直接使用在main中配置好的根logger (通过logging.info等)
+    logger = logging.getLogger(__name__) # 获取当前模块的logger
     logger.info("🔎 正在检查 PyInstaller 是否已安装...")
+
     try:
         # 尝试运行 'pyinstaller --version' 命令来判断是否已安装且可用
         result = subprocess.run(
-            ['pyinstaller', '--version'], 
-            capture_output=True, text=True, check=True, 
+            ['pyinstaller', '--version'],
+            capture_output=True, text=True, check=True,
             encoding='utf-8', errors='ignore'
         )
         logger.info(f"✅ PyInstaller 已找到: {result.stdout.strip()}")
         return True # PyInstaller已安装
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # PyInstaller命令执行失败或未找到，说明未安装或未在PATH中
         logger.warning("⚠️ PyInstaller 未安装或未在系统PATH中。")
+
+        # --- 处理 pythonw.exe 下无法使用 input() 的情况 ---
+        is_pythonw = sys.platform == "win32" and "pythonw.exe" in sys.executable.lower()
         
-        # 提示用户是否安装
+        if is_pythonw:
+            logger.warning("检测到以 pythonw.exe 运行。PyInstaller 未安装。")
+            # 尝试使用 messagebox 提示，如果 tkinter 已可用
+            # 注意：这取决于 _bootstrap_check_dependencies_and_relaunch_if_needed 是否已确保 tkinter 可用
+            # 并且此时可能还没有创建主窗口，messagebox 的 parent 可能需要特殊处理或为 None
+            # 为了简化，这里我们只记录日志并尝试弹出一个简单的非阻塞提示（如果可能）
+            # 或者更安全的是，只记录日志，并让主程序在后面显示一个更全面的GUI提示。
+            message_for_pythonw = (
+                "PyInstaller 未安装，这是打包应用程序所必需的。\n\n"
+                "由于当前在无控制台模式 (pythonw.exe) 下运行，无法直接提示您安装。\n\n"
+                "请尝试从命令行 (cmd.exe 或 PowerShell) 运行此脚本，以便进行 PyInstaller 的安装，\n"
+                "或者手动在您的 Python 环境中运行: pip install pyinstaller"
+            )
+            print(f"[警告] {message_for_pythonw}") # 打印到任何可能的输出（pythonw可能没有）
+            try:
+                # 尝试一个非阻塞的提示，但不依赖用户交互来继续
+                # 这里的 messagebox 可能在引导程序的早期还不能安全使用
+                # if "tkinter" in sys.modules and hasattr(tk, 'messagebox'):
+                #     tk.messagebox.showwarning("PyInstaller缺失", message_for_pythonw)
+                pass
+            except Exception:
+                pass # messagebox 不可用，静默处理
+
+            # 在 pythonw.exe 且 PyInstaller 未安装时，我们不尝试安装，
+            # 让主程序在GUI层面处理这个缺失（比如禁用构建按钮并提示）
+            return False # 表示 PyInstaller 未安装且未尝试安装
+
+        # --- 对于有控制台的环境，使用 input() ---
         user_choice = input("是否立即尝试使用pip安装 PyInstaller (这是打包所必需的)? (y/n): ").strip().lower()
         if user_choice == 'y':
             logger.info("用户选择安装PyInstaller，正在尝试...")
@@ -2079,24 +2637,41 @@ def _main_install_pyinstaller_if_needed():
             try:
                 python_exe = sys.executable # 获取当前Python解释器路径
                 # 在Windows上，如果当前是pythonw.exe，尝试用python.exe执行pip以看到输出
+                # (虽然上面已经处理了pythonw，但这里的逻辑保留以防万一或用于其他上下文)
                 if sys.platform == "win32" and "pythonw.exe" in python_exe.lower():
                     python_console_exe = python_exe.lower().replace("pythonw.exe", "python.exe")
                     if Path(python_console_exe).exists(): # 确保 python.exe 存在
                         python_exe = python_console_exe
 
-                # 执行pip安装命令，不捕获输出，让用户直接在控制台看到pip的安装过程
-                subprocess.run([python_exe, "-m", "pip", "install", "pyinstaller"], check=True) 
+                # 执行pip安装命令
+                # 注意：这里 subprocess.run 的 check=True，如果安装失败会抛出 CalledProcessError
+                # 为了让用户看到pip的输出，可以考虑移除 capture_output=True，或者在出错时打印 e.stdout, e.stderr
+                pip_process = subprocess.run(
+                    [python_exe, "-m", "pip", "install", "pyinstaller"],
+                    check=False, # 设置为False，手动检查returncode
+                    capture_output=True, text=True, encoding='utf-8', errors='replace'
+                )
                 
-                logger.info("✅ PyInstaller 安装命令已成功执行。")
-                print("\n✅ PyInstaller 安装命令已执行。")
-                print("   为了确保新安装的 PyInstaller 能够被正确识别，请您手动重新运行本程序。")
-                input("按回车键退出后，请重新启动 PyInstaller Studio Pro。")
-                sys.exit(0) # 正常退出，提示用户重启
-            except subprocess.CalledProcessError as e_pip_install:
-                logger.error(f"❌ PyInstaller 安装过程中发生错误 (pip返回非零): {e_pip_install}")
-                print(f"\n❌ PyInstaller 安装失败 (pip命令执行出错)。错误详情请查看上述pip输出。")
-                print("   请尝试手动在您的Python环境中运行命令: pip install pyinstaller")
-                return False # 安装失败
+                if pip_process.returncode == 0:
+                    logger.info("✅ PyInstaller 安装命令已成功执行。")
+                    print("\n✅ PyInstaller 安装命令已执行。")
+                    print("   为了确保新安装的 PyInstaller 能够被正确识别，请您手动重新运行本程序。")
+                    input("按回车键退出后，请重新启动 PyInstaller Studio Pro。")
+                    sys.exit(0) # 正常退出，提示用户重启
+                else:
+                    logger.error(f"❌ PyInstaller 安装过程中发生错误 (pip返回代码: {pip_process.returncode})。")
+                    logger.error(f"Pip stdout:\n{pip_process.stdout}")
+                    logger.error(f"Pip stderr:\n{pip_process.stderr}")
+                    print(f"\n❌ PyInstaller 安装失败 (pip命令执行出错)。错误详情:")
+                    if pip_process.stdout: print(f"标准输出:\n{pip_process.stdout}")
+                    if pip_process.stderr: print(f"错误输出:\n{pip_process.stderr}")
+                    print("   请尝试手动在您的Python环境中运行命令: pip install pyinstaller")
+                    return False # 安装失败
+
+            except FileNotFoundError: # 如果 python_exe 或 pip 未找到
+                logger.error("❌ 无法找到Python解释器或pip来安装PyInstaller。")
+                print("\n❌ 无法找到Python解释器或pip。请确保Python已正确安装并添加到系统PATH。")
+                return False
             except Exception as e_pip_unknown: # 捕获其他可能的安装错误
                 logger.error(f"❌ PyInstaller 安装过程中发生未知错误: {e_pip_unknown}", exc_info=True)
                 print(f"\n❌ PyInstaller 安装时发生未知错误: {e_pip_unknown}")
